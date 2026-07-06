@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finlens"
+version = "0.1.0"
+description = "Analyst-LLM lenses over the FinField fact web: sector, industry, country and macro digests with exact quantiles, fact-CID citations and snapshot state_root binding"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = ["finfacts", "finknit"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# The snapshot adapter's pulse edge needs the runtime:
+#   pip install "knitweb @ git+https://github.com/knitweb/pulse"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../facts/src", "../knit/src"]
+testpaths = ["tests"]
