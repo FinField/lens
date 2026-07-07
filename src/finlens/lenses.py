@@ -1,4 +1,4 @@
-"""The four analyst lenses: sector, industry, country, macro.
+"""The classification analyst lenses: sector, industry, country, macro, factor.
 
 Each lens is a pure read model over a bag of facts: it groups entities,
 picks the latest fact per (entity, concept) with a deterministic tie-break,
@@ -25,7 +25,13 @@ from typing import Iterable, Optional
 
 from finfacts.model import Entity, FinFact
 
-from .digest import as_pairs, build_digest, digest_envelope, render_scaled
+from .digest import (
+    as_pairs,
+    build_digest,
+    digest_envelope,
+    quantile_lower,
+    render_scaled,
+)
 from .sectors import SIC_CONCEPT, industry_of, sector_of
 
 # The comparable per-entity metrics the classification lenses aggregate.
@@ -43,6 +49,23 @@ MACRO_CONCEPTS = (
     "finfield:cpi_yoy",
     "finfield:fx_usd",
 )
+
+
+def ticker_country(ticker: str) -> Optional[str]:
+    """Country code from a composite ticker: ``"AIR US" -> "US"``.
+
+    Real-feed ``finfield-entity`` records carry no country field, but the
+    composite ticker does: its second token is the two-letter exchange
+    country code. Deterministic and strict — anything that is not exactly
+    two space-separated tokens with a two-ASCII-uppercase-letter suffix
+    (one-token tickers like ``"BTC"``, pseudo-tickers like ``"US MACRO"``)
+    yields ``None``.
+    """
+    parts = ticker.split(" ")
+    if (len(parts) == 2 and len(parts[1]) == 2 and parts[1].isascii()
+            and parts[1].isalpha() and parts[1].isupper()):
+        return parts[1]
+    return None
 
 
 def latest_by_entity_concept(pairs: Iterable[tuple]) -> dict:
@@ -156,7 +179,14 @@ class IndustryLens(_GroupedLens):
 
 
 class CountryLens(_GroupedLens):
-    """Group entities by Entity.country; unknown country groups as "??"."""
+    """Group entities by Entity.country, with the composite-ticker fallback.
+
+    When ``Entity.country`` is empty — or there is no entity record at all —
+    the composite-ticker suffix decides the group (``"AIR US" -> "US"``, see
+    :func:`ticker_country`); the real feed's entity records carry no country
+    field, so without the fallback every feed entity would land in ``"??"``.
+    Tickers without the two-part shape group visibly as ``"??"``.
+    """
 
     name = "country"
 
@@ -164,9 +194,11 @@ class CountryLens(_GroupedLens):
         return {"group_by": "country", "concepts": list(AGG_CONCEPTS)}
 
     def _classify(self, entity_id, entity, latest, entity_citations):
-        if entity is None or not entity.country:
-            return "??", entity_citations.get(entity_id)
-        return entity.country, entity_citations.get(entity_id)
+        if entity is not None and entity.country:
+            return entity.country, entity_citations.get(entity_id)
+        suffix = ticker_country(entity_id.split(":", 1)[-1])
+        return (suffix if suffix is not None else "??",
+                entity_citations.get(entity_id))
 
 
 class MacroLens:
@@ -176,7 +208,7 @@ class MacroLens:
     the series — each point a ``{"period", "value", "citation"}`` triple —
     so an analyst LLM sees level *and* trajectory, with every point
     independently verifiable. Points dropped by the tail cap are counted
-    in ``truncated``.
+    in ``truncated["series"]`` (groups and citations under their own kinds).
     """
 
     name = "macro"
@@ -230,10 +262,10 @@ class MacroLens:
             if key not in series or rank > series[key][0]:
                 series[key] = (rank, fact, citation)
 
-        dropped = 0
+        dropped_groups = dropped_series = dropped_citations = 0
         keys = sorted(regions)
         if len(keys) > max_groups:
-            dropped += len(keys) - max_groups
+            dropped_groups += len(keys) - max_groups
             keys = keys[:max_groups]
 
         groups = []
@@ -247,7 +279,7 @@ class MacroLens:
                 ends = sorted(end for (r, c, end) in series
                               if r == region and c == concept)
                 if len(ends) > tail:
-                    dropped += len(ends) - tail
+                    dropped_series += len(ends) - tail
                     ends = ends[-tail:]
                 points = []
                 for end in ends:
@@ -260,14 +292,173 @@ class MacroLens:
                     concept_series[concept] = points
             cited = sorted(citations)
             if len(cited) > max_citations_per_group:
-                dropped += len(cited) - max_citations_per_group
+                dropped_citations += len(cited) - max_citations_per_group
                 cited = cited[:max_citations_per_group]
             groups.append({"key": region, "entities": len(regions[region]),
                            "series": concept_series, "citations": cited})
 
         return digest_envelope(self.name, self.scope(), groups,
                                unclassified={"entities": unclassified},
-                               dropped=dropped, out_of_universe=out_of_universe)
+                               truncated={"groups": dropped_groups,
+                                          "series": dropped_series,
+                                          "citations": dropped_citations},
+                               out_of_universe=out_of_universe)
 
 
-ALL_LENSES = (SectorLens, IndustryLens, CountryLens, MacroLens)
+class FactorLens:
+    """Cross-sectional view of one factor concept — the screen an analyst
+    LLM actually needs for "is this cheap?" questions.
+
+    The cross-section is the latest factor fact per entity — facts are
+    filtered to ``factor_unit`` *before* latest-selection (a later fact in
+    a foreign unit never shadows a valid factor fact; a factor never mixes
+    units), then the same ``(period.end, cid)`` tie-break as the grouped
+    lenses picks one fact per entity. On top of the standard envelope the
+    digest carries:
+
+    - ``"deciles"``: the 11 boundary values (min, d1..d9, max) of the
+      cross-section — exact lower-interpolation quantiles at the finest
+      common scale, rendered exact; ``[]`` when the cross-section is empty;
+    - ``"groups"``: per SIC-division sector (via each entity's
+      ``finfield:sic`` fact; entities with a factor value but no sic fact
+      group visibly under ``"unclassified"``) the standard metric block for
+      the factor concept, entity count, and citations — the factor-fact
+      CIDs plus the classifying sic CIDs, capped with visible truncation;
+    - ``"top"`` / ``"bottom"``: the ``top_n`` entities by factor value as
+      ``{"entity", "value", "period_end", "citation"}``, selected only from
+      values within the Tukey-style fences (below). Ordering is fully
+      deterministic: ``bottom`` ascends by ``(value, entity_id)``; ``top``
+      descends by value with ties broken by ascending entity_id;
+    - ``"outliers"``: values outside the fences never rank in top/bottom
+      but never disappear either — ``{"count": n, "high": [entries, max 3
+      most extreme], "low": [entries, max 3 most extreme]}``, entries
+      shaped like top/bottom entries.
+
+    Degenerate outliers are fenced with exact integer math at the common
+    scale: ``lo = d1 - 3*(d9 - d1)``, ``hi = d9 + 3*(d9 - d1)`` over the
+    cross-section's own deciles; the rendered fences ride in
+    ``scope["fences"]``. Scope also states the factor's ``orientation``
+    (which end is "good") and a ``staleness_note`` — ratio inputs may
+    differ by up to 400 days under the derive guard, and every ranked
+    entry carries its factor fact's ``period_end`` so mixing is visible.
+
+    Entities without a usable factor value (no factor fact, or only
+    foreign-unit ones) cannot enter the cross-section and are counted in
+    the digest's ``unclassified`` — distinct from the visible
+    ``"unclassified"`` sector group, which holds entities *with* a factor
+    value but no sic.
+    """
+
+    name = "factor"
+
+    def __init__(self, factor_concept: str = "finfield:book_to_float_mcap",
+                 factor_unit: str = "pure", top_n: int = 5,
+                 orientation: str = ("higher = cheaper (book value per unit "
+                                     "of free-float market cap)")) -> None:
+        self.factor_concept = factor_concept
+        self.factor_unit = factor_unit
+        self.top_n = top_n
+        self.orientation = orientation
+
+    def scope(self) -> dict:
+        return {"factor": self.factor_concept, "unit": self.factor_unit,
+                "top_n": self.top_n, "orientation": self.orientation,
+                "staleness_note": ("ratio inputs may differ by up to "
+                                   "400 days (derive guard)")}
+
+    def build(self, facts: Iterable, entities: Optional[Iterable[Entity]] = None,
+              max_groups: int = 32, max_citations_per_group: int = 8,
+              entity_citations: Optional[dict] = None) -> dict:
+        pairs = as_pairs(facts)
+        latest = latest_by_entity_concept(pairs)
+        # factor facts filter to factor_unit BEFORE latest-selection, so a
+        # later foreign-unit fact never shadows a valid factor fact
+        factor_latest = latest_by_entity_concept(
+            (fact, citation) for fact, citation in pairs
+            if fact.concept == self.factor_concept
+            and fact.unit == self.factor_unit)
+        entity_map = {e.entity_id: e for e in entities} if entities is not None else {}
+        fact_entities = {fact.entity_id for fact, _ in pairs}
+        # UNION universe, mirroring _GroupedLens: a factor fact without an
+        # entity record still enters the cross-section, and is counted.
+        universe = sorted(set(entity_map) | fact_entities)
+        out_of_universe = (len(fact_entities - set(entity_map))
+                           if entities is not None else 0)
+
+        cross: list = []  # one (fact, citation) per entity in the cross-section
+        grouped: dict = {}
+        group_entities: dict = {}
+        group_citations: dict = {}
+        unclassified = 0
+        for entity_id in universe:
+            hit = factor_latest.get((entity_id, self.factor_concept))
+            if hit is None:
+                unclassified += 1
+                continue
+            cross.append(hit)
+            sic_hit = latest.get((entity_id, SIC_CONCEPT))
+            if sic_hit is None:
+                key = "unclassified"
+            else:
+                key = sector_of(sic_hit[0].value)
+                group_citations.setdefault(key, set()).add(sic_hit[1])
+            group_entities[key] = group_entities.get(key, 0) + 1
+            grouped.setdefault(key, []).append(hit)
+
+        digest = build_digest(
+            self.name, self.scope(), grouped,
+            max_groups=max_groups,
+            max_citations_per_group=max_citations_per_group,
+            group_entities=group_entities,
+            group_citations=group_citations,
+            unclassified={"entities": unclassified},
+            out_of_universe=out_of_universe,
+        )
+
+        if cross:
+            common = max(fact.scale for fact, _ in cross)
+            rows = sorted((fact.value * 10 ** (common - fact.scale),
+                           fact.entity_id, citation, fact.period.end)
+                          for fact, citation in cross)
+            values = [row[0] for row in rows]
+            digest["deciles"] = [
+                render_scaled(quantile_lower(values, i, 10), common)
+                for i in range(11)]
+
+            # Tukey-style fences on the cross-section's own deciles — exact
+            # integer math at the common scale. top/bottom rank inliers
+            # only; everything outside goes to the visible outliers section.
+            d1 = quantile_lower(values, 1, 10)
+            d9 = quantile_lower(values, 9, 10)
+            lo = d1 - 3 * (d9 - d1)
+            hi = d9 + 3 * (d9 - d1)
+            digest["scope"]["fences"] = {"low": render_scaled(lo, common),
+                                         "high": render_scaled(hi, common)}
+
+            def entry(row: tuple) -> dict:
+                value, entity_id, citation, period_end = row
+                return {"entity": entity_id,
+                        "value": render_scaled(value, common),
+                        "period_end": period_end,
+                        "citation": citation}
+
+            inliers = [r for r in rows if lo <= r[0] <= hi]
+            low = [r for r in rows if r[0] < lo]    # ascending: most extreme first
+            high = sorted((r for r in rows if r[0] > hi),
+                          key=lambda r: (-r[0], r[1]))  # most extreme first
+            digest["bottom"] = [entry(r) for r in inliers[:self.top_n]]
+            digest["top"] = [entry(r) for r in
+                             sorted(inliers, key=lambda r: (-r[0], r[1]))
+                             [:self.top_n]]
+            digest["outliers"] = {"count": len(low) + len(high),
+                                  "high": [entry(r) for r in high[:3]],
+                                  "low": [entry(r) for r in low[:3]]}
+        else:
+            digest["deciles"] = []
+            digest["bottom"] = []
+            digest["top"] = []
+            digest["outliers"] = {"count": 0, "high": [], "low": []}
+        return digest
+
+
+ALL_LENSES = (SectorLens, IndustryLens, CountryLens, MacroLens, FactorLens)

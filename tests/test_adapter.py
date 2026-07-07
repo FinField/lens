@@ -116,7 +116,7 @@ def test_country_lens_over_real_snapshot():
     # caps pass through to the lens
     capped = snapshot_digest(snap, CountryLens(), max_groups=1)
     assert len(capped["groups"]) == 1
-    assert capped["truncated"] == {"dropped": 1}
+    assert capped["truncated"] == {"groups": 1}
 
 
 @requires_pulse
@@ -164,7 +164,7 @@ def test_macro_lens_over_real_snapshot():
     assert d["state_root"] == snap["state_root"]
     assert d["unclassified"] == {"entities": 0}
     assert d["out_of_universe"] == 0
-    assert d["truncated"] == {"dropped": 2}  # 4 points, tail=2
+    assert d["truncated"] == {"series": 2}  # 4 points, tail=2
 
     assert [g["key"] for g in d["groups"]] == ["US"]
     us = d["groups"][0]

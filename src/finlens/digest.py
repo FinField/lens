@@ -19,7 +19,10 @@ Digest shape::
                  "citations": [fact CIDs backing the medians]}, ...],
      "unclassified": {...},          # visible, never dropped silently
      "out_of_universe": n,           # fact entities missing a universe entry
-     "truncated": {"dropped": n},    # only present when a cap dropped items
+     "truncated": {kind: n, ...},    # per-kind drop counters ("groups",
+                                     # "citations", "history", ...); only
+                                     # present when a cap dropped items,
+                                     # and only the kinds that dropped
      "state_root": <64-hex or None>}
 
 Metrics partition by ``(concept, unit)`` — a USD and a JPY revenue never
@@ -97,13 +100,17 @@ def metric_summary(values: Sequence[int], scale: int) -> dict:
 
 
 def digest_envelope(lens_name: str, scope: dict, groups: list,
-                    unclassified: Optional[dict] = None, dropped: int = 0,
+                    unclassified: Optional[dict] = None,
+                    truncated: Optional[Mapping[str, int]] = None,
                     out_of_universe: int = 0,
                     state_root: Optional[str] = None) -> dict:
     """The common digest wrapper every lens shares.
 
-    ``truncated`` appears only when a cap actually dropped items — a digest
-    never truncates silently. ``unclassified`` is always present, and so is
+    ``truncated`` maps a drop kind (``"groups"``, ``"citations"``,
+    ``"history"``, ...) to the exact count a cap dropped; only kinds that
+    actually dropped something appear, and the key is absent entirely when
+    nothing dropped — a digest never truncates silently, and never pads
+    either. ``unclassified`` is always present, and so is
     ``out_of_universe``: the count of distinct entity_ids that carried facts
     but had no entity record / universe entry (0 when none).
     """
@@ -116,8 +123,9 @@ def digest_envelope(lens_name: str, scope: dict, groups: list,
         "out_of_universe": out_of_universe,
         "state_root": state_root,
     }
-    if dropped:
-        digest["truncated"] = {"dropped": dropped}
+    counters = {kind: n for kind, n in (truncated or {}).items() if n}
+    if counters:
+        digest["truncated"] = counters
     return digest
 
 
@@ -140,12 +148,13 @@ def build_digest(lens_name: str, scope: dict,
     a lens supplies (e.g. the classification facts that decided the key).
 
     Groups iterate in sorted-key order; when caps drop groups or citations
-    the digest says so in ``truncated: {"dropped": n}``.
+    the digest says so per kind in ``truncated: {"groups": n}`` /
+    ``{"citations": n}``.
     """
-    dropped = 0
+    dropped_groups = dropped_citations = 0
     keys = sorted(grouped_facts)
     if len(keys) > max_groups:
-        dropped += len(keys) - max_groups
+        dropped_groups += len(keys) - max_groups
         keys = keys[:max_groups]
 
     groups = []
@@ -164,7 +173,7 @@ def build_digest(lens_name: str, scope: dict,
             citations.update(citation for _, citation in rows)
         cited = sorted(citations)
         if len(cited) > max_citations_per_group:
-            dropped += len(cited) - max_citations_per_group
+            dropped_citations += len(cited) - max_citations_per_group
             cited = cited[:max_citations_per_group]
         entities = (group_entities[key] if group_entities is not None
                     else len({fact.entity_id for fact, _ in pairs}))
@@ -172,5 +181,7 @@ def build_digest(lens_name: str, scope: dict,
                        "metrics": metrics, "citations": cited})
 
     return digest_envelope(lens_name, scope, groups, unclassified=unclassified,
-                           dropped=dropped, out_of_universe=out_of_universe,
+                           truncated={"groups": dropped_groups,
+                                      "citations": dropped_citations},
+                           out_of_universe=out_of_universe,
                            state_root=state_root)

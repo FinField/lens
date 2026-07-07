@@ -1,7 +1,8 @@
 """finlens — analyst-LLM lenses over the FinField fact web.
 
-Sector, industry, country and macro digests an analyst LLM can consume
-directly, computed under the pulse Lens contract's four invariants:
+Sector, industry, country, macro, cross-sectional factor and one-company
+digests an analyst LLM can consume directly, computed under the pulse Lens
+contract's four invariants:
 
 1. **Ephemeral interpret layer** — a lens is handed a read-only projection
    of facts (at most a ``web_snapshot``), interprets it, and is done; it
@@ -40,10 +41,19 @@ from .lenses import (  # noqa: F401
     ALL_LENSES,
     MACRO_CONCEPTS,
     CountryLens,
+    FactorLens,
     IndustryLens,
     MacroLens,
     SectorLens,
     latest_by_entity_concept,
+    ticker_country,
+)
+from .company import (  # noqa: F401
+    BUCKETS,
+    CONCEPT_BUCKETS,
+    DERIVED_SOURCE_KINDS,
+    CompanyLens,
+    is_derived_fact,
 )
 from .adapter import (  # noqa: F401
     HAS_PULSE,

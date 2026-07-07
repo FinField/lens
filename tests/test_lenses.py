@@ -13,7 +13,8 @@ Universe: 3 sectors, 2 countries.
   HHH     NL       7372  Services        20           500000        -
 """
 from finfacts.model import Entity, FinFact, Period, Source, canonical_json
-from finlens.lenses import CountryLens, IndustryLens, MacroLens, SectorLens
+from finlens.lenses import (CountryLens, IndustryLens, MacroLens, SectorLens,
+                            ticker_country)
 
 SRC = Source(kind="test-fixture", ref="t1", fetched="2026-01-01")
 
@@ -160,11 +161,45 @@ def test_unclassified_is_visible():
 
 
 def test_country_lens_missing_country_groups_as_qq():
-    entities = [Entity(ticker="JJJ")]  # no country
+    entities = [Entity(ticker="JJJ")]  # no country, no composite suffix
     facts = [_fact("JJJ", "finfield:revenue_ttm", 7)]
     d = CountryLens().build(facts, entities)
     assert [g["key"] for g in d["groups"]] == ["??"]
     assert d["groups"][0]["entities"] == 1
+
+
+def test_ticker_country_shapes():
+    assert ticker_country("AIR US") == "US"
+    assert ticker_country("PHIA NA") == "NA"
+    assert ticker_country("BTC") is None        # one token
+    assert ticker_country("US MACRO") is None   # suffix not two letters
+    assert ticker_country("A B C") is None      # three tokens
+    assert ticker_country("AIR us") is None     # not uppercase
+    assert ticker_country("AIR U1") is None     # not alphabetic
+
+
+def test_country_lens_composite_ticker_fallback():
+    # entity records from the real feed carry NO country field — the
+    # composite-ticker suffix is the deterministic fallback
+    entities = [Entity(ticker="AIR US"),               # suffix decides
+                Entity(ticker="PHIA NA"),              # suffix decides
+                Entity(ticker="VOW3 GY", country="DE"),  # explicit wins
+                Entity(ticker="BTC"),                  # no suffix -> "??"
+                Entity(ticker="US MACRO")]             # no 2-letter suffix -> "??"
+    facts = [_fact("AIR US", "finfield:revenue_ttm", 1),
+             _fact("PHIA NA", "finfield:revenue_ttm", 2),
+             _fact("VOW3 GY", "finfield:revenue_ttm", 3),
+             _fact("BTC", "finfield:revenue_ttm", 4),
+             _fact("US MACRO", "finfield:revenue_ttm", 5),
+             # no entity record at all: the fact's entity_id still decides
+             _fact("AF FP", "finfield:revenue_ttm", 6)]
+    d = CountryLens().build(facts, entities)
+    assert [(g["key"], g["entities"]) for g in d["groups"]] == [
+        ("??", 2), ("DE", 1), ("FP", 1), ("NA", 1), ("US", 1)]
+    assert d["out_of_universe"] == 1  # AF FP carried facts, no record
+    assert d["unclassified"] == {"entities": 0}
+    d2 = CountryLens().build(list(reversed(facts)), list(reversed(entities)))
+    assert canonical_json(d) == canonical_json(d2)
 
 
 def test_macro_lens_series_tail():
@@ -189,7 +224,7 @@ def test_macro_lens_series_tail():
     assert [g["key"] for g in d["groups"]] == ["EU", "US"]
     assert d["unclassified"] == {"entities": 1}
     assert d["out_of_universe"] == 0
-    assert d["truncated"] == {"dropped": 2}  # 6 US policy points, tail=4
+    assert d["truncated"] == {"series": 2}  # 6 US policy points, tail=4
 
     us = _group(d, "US")
     assert us["entities"] == 1

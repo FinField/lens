@@ -95,7 +95,7 @@ def test_two_builds_byte_identical():
     assert d1["out_of_universe"] == 0
 
 
-# 4 — caps never truncate silently
+# 4 — caps never truncate silently, and say per kind what they dropped
 def test_truncation_marker():
     grouped = {
         "a": [_fact("A1", value=1), _fact("A2", value=2), _fact("A3", value=3)],
@@ -104,7 +104,7 @@ def test_truncation_marker():
     }
     d = build_digest("test", {}, grouped, max_groups=2, max_citations_per_group=2)
     # group "c" dropped (1) + one of "a"'s three citations dropped (1)
-    assert d["truncated"] == {"dropped": 2}
+    assert d["truncated"] == {"groups": 1, "citations": 1}
     assert [g["key"] for g in d["groups"]] == ["a", "b"]
     assert len(d["groups"][0]["citations"]) == 2
 
